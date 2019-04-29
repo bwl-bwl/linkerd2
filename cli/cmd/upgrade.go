@@ -50,43 +50,28 @@ func (options *upgradeOptions) upgradeOnlyFlagSet() *pflag.FlagSet {
 	return flags
 }
 
-func newCmdUpgrade() *cobra.Command {
+// newCmdUpgradeConfig is a subcommand for `linkerd upgrade config`
+func newCmdUpgradeConfig() *cobra.Command {
 	options := newUpgradeOptionsWithDefaults()
-	flags := options.recordableFlagSet()
-	upgradeOnlyFlags := options.upgradeOnlyFlagSet()
 
 	cmd := &cobra.Command{
-		Use:       fmt.Sprintf("upgrade [%s|%s] [flags]", configStage, controlPlaneStage),
-		Args:      cobra.OnlyValidArgs,
-		ValidArgs: []string{configStage, controlPlaneStage},
-		Short:     "Output Kubernetes configs to upgrade an existing Linkerd control plane",
-		Long: `Output Kubernetes configs to upgrade an existing Linkerd control plane.
+		Use:   "config [flags]",
+		Args:  cobra.NoArgs,
+		Short: "Output Kubernetes cluster-wide resources to upgrade an existing Linkerd",
+		Long: `Output Kubernetes cluster-wide resources to upgrade an existing Linkerd.
 
-Note that the default flag values for this command come from the Linkerd control
-plane. The default values displayed in the Flags section below only apply to the
-install command.`,
-
+Note that this command should be followed by "linkerd upgrade control-plane".`,
 		Example: `  # Default upgrade.
-  linkerd upgrade | kubectl apply -f -
-
-  # Similar to install, upgrade may also be broken up into two stages, by user
-  # privilege.
-  # First stage requires cluster-level privileges.
-  linkerd upgrade config | kubectl apply -f -
-  # Second stage requires namespace-level privileges.
-  linkerd upgrade control-plane | kubectl apply -f -`,
+  linkerd upgrade config | kubectl apply -f -`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// TODO: factor this out with `linkerd upgrade`
 			if options.ignoreCluster {
 				panic("ignore cluster must be unset") // Programmer error.
 			}
 
-			stage, err := validateArgs(args, flags, upgradeOnlyFlags)
-			if err != nil {
-				return err
-			}
-
 			// We need a Kubernetes client to fetch configs and issuer secrets.
 			var k kubernetes.Interface
+			var err error
 			if options.manifests != "" {
 				readers, err := read(options.manifests)
 				if err != nil {
@@ -104,7 +89,7 @@ install command.`,
 				}
 			}
 
-			values, configs, err := options.validateAndBuild(stage, k, flags)
+			values, configs, err := options.validateAndBuild(configStage, k, nil)
 			if err != nil {
 				upgradeErrorf("Failed to build upgrade configuration: %s", err)
 			}
@@ -119,9 +104,74 @@ install command.`,
 			buf.WriteTo(os.Stdout)
 
 			fmt.Fprintf(os.Stderr, "\n%s %s\n", okStatus, okMessage)
-			if stage == configStage {
-				fmt.Fprintf(os.Stderr, "%s\n", controlPlaneMessage)
+			fmt.Fprintf(os.Stderr, "%s\n", controlPlaneMessage)
+			fmt.Fprintf(os.Stderr, "%s\n\n", visitMessage)
+
+			return nil
+		},
+	}
+
+	return cmd
+}
+
+// newCmdUpgradeControlPlane is a subcommand for `linkerd upgrade control-plane`
+func newCmdUpgradeControlPlane() *cobra.Command {
+	options := newUpgradeOptionsWithDefaults()
+	flags := options.recordableFlagSet()
+	upgradeOnlyFlags := options.upgradeOnlyFlagSet()
+
+	cmd := &cobra.Command{
+		Use:   "control-plane [flags]",
+		Args:  cobra.NoArgs,
+		Short: "Output Kubernetes control plane resources to upgrade an existing Linkerd",
+		Long: `Output Kubernetes control plane resources to upgrade an existing Linkerd.
+
+Note that the default flag values for this command come from the Linkerd control
+plane. The default values displayed in the Flags section below only apply to the
+install command. It should be run after "linkerd upgrade config".`,
+		Example: `  # Default upgrade.
+  linkerd upgrade control-plane | kubectl apply -f -`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// TODO: factor this out with `linkerd upgrade`
+			if options.ignoreCluster {
+				panic("ignore cluster must be unset") // Programmer error.
 			}
+
+			// We need a Kubernetes client to fetch configs and issuer secrets.
+			var k kubernetes.Interface
+			var err error
+			if options.manifests != "" {
+				readers, err := read(options.manifests)
+				if err != nil {
+					upgradeErrorf("Failed to parse manifests from %s: %s", options.manifests, err)
+				}
+
+				k, err = k8s.NewFakeAPIFromManifests(readers)
+				if err != nil {
+					upgradeErrorf("Failed to parse Kubernetes objects from manifest %s: %s", options.manifests, err)
+				}
+			} else {
+				k, err = k8s.NewAPI(kubeconfigPath, kubeContext, 0)
+				if err != nil {
+					upgradeErrorf("Failed to create a kubernetes client: %s", err)
+				}
+			}
+
+			values, configs, err := options.validateAndBuild(controlPlaneStage, k, flags)
+			if err != nil {
+				upgradeErrorf("Failed to build upgrade configuration: %s", err)
+			}
+
+			// rendering to a buffer and printing full contents of buffer after
+			// render is complete, to ensure that okStatus prints separately
+			var buf bytes.Buffer
+			if err = values.render(&buf, configs); err != nil {
+				upgradeErrorf("Could not render upgrade configuration: %s", err)
+			}
+
+			buf.WriteTo(os.Stdout)
+
+			fmt.Fprintf(os.Stderr, "\n%s %s\n", okStatus, okMessage)
 			fmt.Fprintf(os.Stderr, "%s\n\n", visitMessage)
 
 			return nil
@@ -130,6 +180,81 @@ install command.`,
 
 	cmd.PersistentFlags().AddFlagSet(flags)
 	cmd.PersistentFlags().AddFlagSet(upgradeOnlyFlags)
+	return cmd
+}
+
+func newCmdUpgrade() *cobra.Command {
+	options := newUpgradeOptionsWithDefaults()
+	flags := options.recordableFlagSet()
+	upgradeOnlyFlags := options.upgradeOnlyFlagSet()
+
+	cmd := &cobra.Command{
+		Use:   "upgrade [flags]",
+		Args:  cobra.NoArgs,
+		Short: "Output Kubernetes configs to upgrade an existing Linkerd control plane",
+		Long: `Output Kubernetes configs to upgrade an existing Linkerd control plane.
+
+Note that the default flag values for this command come from the Linkerd control
+plane. The default values displayed in the Flags section below only apply to the
+install command.`,
+
+		Example: `  # Default upgrade.
+  linkerd upgrade | kubectl apply -f -
+
+  # Similar to install, upgrade may also be broken up into two stages, by user
+  # privilege.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if options.ignoreCluster {
+				panic("ignore cluster must be unset") // Programmer error.
+			}
+
+			// We need a Kubernetes client to fetch configs and issuer secrets.
+			var k kubernetes.Interface
+			var err error
+			if options.manifests != "" {
+				readers, err := read(options.manifests)
+				if err != nil {
+					upgradeErrorf("Failed to parse manifests from %s: %s", options.manifests, err)
+				}
+
+				k, err = k8s.NewFakeAPIFromManifests(readers)
+				if err != nil {
+					upgradeErrorf("Failed to parse Kubernetes objects from manifest %s: %s", options.manifests, err)
+				}
+			} else {
+				k, err = k8s.NewAPI(kubeconfigPath, kubeContext, 0)
+				if err != nil {
+					upgradeErrorf("Failed to create a kubernetes client: %s", err)
+				}
+			}
+
+			values, configs, err := options.validateAndBuild("", k, flags)
+			if err != nil {
+				upgradeErrorf("Failed to build upgrade configuration: %s", err)
+			}
+
+			// rendering to a buffer and printing full contents of buffer after
+			// render is complete, to ensure that okStatus prints separately
+			var buf bytes.Buffer
+			if err = values.render(&buf, configs); err != nil {
+				upgradeErrorf("Could not render upgrade configuration: %s", err)
+			}
+
+			buf.WriteTo(os.Stdout)
+
+			fmt.Fprintf(os.Stderr, "\n%s %s\n", okStatus, okMessage)
+			fmt.Fprintf(os.Stderr, "%s\n\n", visitMessage)
+
+			return nil
+		},
+	}
+
+	cmd.LocalFlags().AddFlagSet(flags)
+	cmd.LocalFlags().AddFlagSet(upgradeOnlyFlags)
+
+	cmd.AddCommand(newCmdUpgradeConfig())
+	cmd.AddCommand(newCmdUpgradeControlPlane())
+
 	return cmd
 }
 
